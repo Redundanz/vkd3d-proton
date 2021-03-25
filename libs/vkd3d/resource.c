@@ -297,6 +297,25 @@ static bool vkd3d_sparse_image_may_have_mip_tail(const D3D12_RESOURCE_DESC *desc
             mip_extent.depth < block_extent.depth;
 }
 
+static bool vkd3d_resource_can_be_vrs(struct d3d12_device *device,
+    const D3D12_HEAP_PROPERTIES *heap_properties, const D3D12_RESOURCE_DESC *desc)
+{
+    return device->d3d12_caps.options6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2 &&
+            desc->Format == DXGI_FORMAT_R8_UINT &&
+            desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc->MipLevels == 1 &&
+            desc->SampleDesc.Count == 1 &&
+            desc->SampleDesc.Quality == 0 &&
+            desc->Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+            heap_properties &&
+            !is_cpu_accessible_heap(heap_properties) &&
+            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY));
+}
+
 static HRESULT vkd3d_create_image(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
         const D3D12_RESOURCE_DESC *desc, struct d3d12_resource *resource, VkImage *vk_image)
@@ -442,6 +461,9 @@ static HRESULT vkd3d_create_image(struct d3d12_device *device,
                 ? VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                 : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
+
+    if (vkd3d_resource_can_be_vrs(device, heap_properties, desc))
+        image_info.usage |= VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
     if (device->unique_queue_mask & (device->unique_queue_mask - 1))
     {
@@ -2231,6 +2253,9 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
     if ((resource->flags & VKD3D_RESOURCE_ALLOCATION) && resource->mem.vk_memory)
         vkd3d_free_memory(device, &device->memory_allocator, &resource->mem);
 
+    if (resource->vrs_view)
+        VK_CALL(vkDestroyImageView(device->vk_device, resource->vrs_view, NULL));
+
     vkd3d_private_store_destroy(&resource->private_store);
     d3d12_device_release(resource->device);
     vkd3d_free(resource);
@@ -2400,6 +2425,30 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             ERR("Failed to bind image memory, vr %d.\n", vr);
             hr = hresult_from_vk_result(vr);
             goto fail;
+        }
+
+        if (vkd3d_resource_can_be_vrs(device, heap_properties, desc))
+        {
+            /* Make the implicit VRS view here... */
+            VkImageViewCreateInfo vrs_view_info;
+            vrs_view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vrs_view_info.pNext = NULL;
+            vrs_view_info.flags = 0;
+            vrs_view_info.image = object->res.vk_image;
+            vrs_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vrs_view_info.format = VK_FORMAT_R8_UINT;
+            vrs_view_info.components = (VkComponentMapping) {
+                VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY
+            };
+            vrs_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vrs_view_info.subresourceRange.baseMipLevel = 0;
+            vrs_view_info.subresourceRange.levelCount = 1;
+            vrs_view_info.subresourceRange.baseArrayLayer = 0;
+            vrs_view_info.subresourceRange.layerCount = 1;
+
+            if ((vr = VK_CALL(vkCreateImageView(device->vk_device, &vrs_view_info, NULL, &object->vrs_view))) < 0)
+                WARN("Failed to create implicit VRS view, vr %d.\n", vr);
         }
     }
     else
