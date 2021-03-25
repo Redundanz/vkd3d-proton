@@ -810,6 +810,13 @@ static uint32_t vkd3d_physical_device_get_time_domains(struct d3d12_device *devi
     return result;
 }
 
+bool d3d12_device_supports_ray_tracing_tier_1_0(const struct d3d12_device *device)
+{
+    return device->device_info.acceleration_structure_features.accelerationStructure &&
+            device->device_info.ray_tracing_pipeline_features.rayTracingPipeline &&
+            device->d3d12_caps.options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
+}
+
 bool d3d12_device_supports_variable_shading_rate_tier_1(struct d3d12_device *device)
 {
     const struct vkd3d_physical_device_info *info = &device->device_info;
@@ -818,11 +825,13 @@ bool d3d12_device_supports_variable_shading_rate_tier_1(struct d3d12_device *dev
             (device->vk_info.device_limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_2_BIT);
 }
 
-bool d3d12_device_supports_ray_tracing_tier_1_0(const struct d3d12_device *device)
+bool d3d12_device_supports_variable_shading_rate_tier_2(struct d3d12_device *device)
 {
-    return device->device_info.acceleration_structure_features.accelerationStructure &&
-            device->device_info.ray_tracing_pipeline_features.rayTracingPipeline &&
-            device->d3d12_caps.options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
+    const struct vkd3d_physical_device_info *info = &device->device_info;
+
+    return info->fragment_shading_rate_properties.fragmentShadingRateNonTrivialCombinerOps &&
+            info->fragment_shading_rate_features.attachmentFragmentShadingRate &&
+            info->fragment_shading_rate_features.primitiveFragmentShadingRate;
 }
 
 static D3D12_VARIABLE_SHADING_RATE_TIER d3d12_device_determine_variable_shading_rate_tier(struct d3d12_device *device)
@@ -830,15 +839,10 @@ static D3D12_VARIABLE_SHADING_RATE_TIER d3d12_device_determine_variable_shading_
     if (!d3d12_device_supports_variable_shading_rate_tier_1(device))
         return D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
 
-    /* TODO: TIER_2
-        - impl RSSetShadingRateImage
-        - prop fragmentShadingRateNonTrivialCombinerOp
-        - feat primitiveFragmentShadingRate
-            - DXIL bringup for PrimitiveShadingRateKHR built-in
-        - feat attachmentFragmentShadingRate
-    */
+    if (!d3d12_device_supports_variable_shading_rate_tier_2(device))
+        return D3D12_VARIABLE_SHADING_RATE_TIER_1;
 
-    return D3D12_VARIABLE_SHADING_RATE_TIER_1;
+    return D3D12_VARIABLE_SHADING_RATE_TIER_2;
 }
 
 static const struct
@@ -4701,10 +4705,20 @@ static void d3d12_device_caps_init_feature_options6(struct d3d12_device *device)
 
     options6->AdditionalShadingRatesSupported = device->device_info.additional_shading_rates_supported;
     options6->VariableShadingRateTier = d3d12_device_determine_variable_shading_rate_tier(device);
+    if (options6->VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2)
+    {
+        options6->ShadingRateImageTileSize = max(
+                device->device_info.fragment_shading_rate_properties.minFragmentShadingRateAttachmentTexelSize.width,
+                device->device_info.fragment_shading_rate_properties.minFragmentShadingRateAttachmentTexelSize.height);
 
-    /* Currently not supported, requires TIER_2 shading rate */
-    options6->PerPrimitiveShadingRateSupportedWithViewportIndexing = FALSE;
-    options6->ShadingRateImageTileSize = 0;
+        options6->PerPrimitiveShadingRateSupportedWithViewportIndexing =
+                device->device_info.fragment_shading_rate_properties.primitiveFragmentShadingRateWithMultipleViewports;
+    }
+    else
+    {
+        options6->ShadingRateImageTileSize = 0;
+        options6->PerPrimitiveShadingRateSupportedWithViewportIndexing = FALSE;
+    }
     /* Not implemented */
     options6->BackgroundProcessingSupported = FALSE;
 }
